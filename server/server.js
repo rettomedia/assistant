@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import Groq from "groq-sdk";
-
 import express from 'express';
 import cors from 'cors';
 import qrcode from 'qrcode-terminal';
@@ -33,8 +32,19 @@ const savePersona = () => fs.writeFileSync(PERSONA_FILE, JSON.stringify(persona,
 const messageHistory = {};
 
 const SESSION_DIR = './.wwebjs_auth';
+
+let whatsappState = {
+    isReady: false,
+    isAuthenticated: false,
+    qrCode: null,
+    isConnecting: false
+};
+
 const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_DIR }),
+    authStrategy: new LocalAuth({
+        dataPath: SESSION_DIR,
+        clientId: "whatsapp-assistant"
+    }),
     puppeteer: {
         headless: true,
         args: [
@@ -52,29 +62,130 @@ const client = new Client({
 
 let qrCode = null;
 
+const checkExistingSession = async () => {
+    try {
+        if (fs.existsSync(SESSION_DIR)) {
+            const sessionFiles = fs.readdirSync(SESSION_DIR);
+            const hasSession = sessionFiles.some(file =>
+                file.includes('session') || file.includes('LocalAuth')
+            );
+            console.log('📁 Mevcut session bulundu:', hasSession);
+            return hasSession;
+        }
+        return false;
+    } catch (error) {
+        console.log('❌ Session kontrol hatası:', error);
+        return false;
+    }
+};
+
 client.on('qr', (qr) => {
     qrCode = qr;
+    whatsappState.qrCode = qr;
+    whatsappState.isReady = false;
+    whatsappState.isAuthenticated = false;
     console.log('QR oluşturuldu');
     io.emit('qr', qr);
+    io.emit('whatsapp_status', {
+        status: 'qr_required',
+        hasSession: false,
+        isReady: false
+    });
 });
 
 client.on('authenticated', () => {
+    whatsappState.isAuthenticated = true;
+    whatsappState.isConnecting = false;
     console.log('✅ WhatsApp doğrulandı');
     io.emit('authenticated');
+    io.emit('whatsapp_status', {
+        status: 'authenticated',
+        hasSession: true,
+        isReady: false
+    });
 });
 
 client.on('ready', () => {
     qrCode = null;
+    whatsappState.isReady = true;
+    whatsappState.isAuthenticated = true;
+    whatsappState.qrCode = null;
+    whatsappState.isConnecting = false;
     console.log('✅ WhatsApp bağlı');
     io.emit('ready');
+    io.emit('whatsapp_status', {
+        status: 'ready',
+        hasSession: true,
+        isReady: true
+    });
 });
 
-client.on('disconnected', () => {
-    console.log('⚠️ Bağlantı koptu');
-    io.emit('disconnected');
+client.on('disconnected', (reason) => {
+    whatsappState.isReady = false;
+    whatsappState.isAuthenticated = false;
+    whatsappState.isConnecting = false;
+    console.log('⚠️ Bağlantı koptu:', reason);
+    io.emit('disconnected', reason);
+    io.emit('whatsapp_status', {
+        status: 'disconnected',
+        hasSession: false,
+        isReady: false
+    });
+
+    setTimeout(() => {
+        console.log('🔄 Otomatik yeniden bağlanılıyor...');
+        initializeWhatsApp();
+    }, 5000);
 });
 
-client.initialize();
+client.on('loading_screen', (percent, message) => {
+    console.log(`🔄 Yükleniyor: ${percent}% - ${message}`);
+    io.emit('loading_screen', `${percent}% - ${message}`);
+    io.emit('whatsapp_status', {
+        status: 'loading',
+        hasSession: true,
+        isReady: false,
+        progress: percent
+    });
+});
+
+const initializeWhatsApp = async () => {
+    try {
+        whatsappState.isConnecting = true;
+        const hasSession = await checkExistingSession();
+
+        if (hasSession) {
+            console.log('🔄 Mevcut session ile başlatılıyor...');
+            io.emit('whatsapp_status', {
+                status: 'restoring_session',
+                hasSession: true,
+                isReady: false
+            });
+        } else {
+            console.log('🆕 Yeni session başlatılıyor...');
+            io.emit('whatsapp_status', {
+                status: 'new_session',
+                hasSession: false,
+                isReady: false
+            });
+        }
+
+        await client.initialize();
+    } catch (error) {
+        console.error('❌ WhatsApp başlatma hatası:', error);
+        whatsappState.isConnecting = false;
+        io.emit('whatsapp_status', {
+            status: 'error',
+            hasSession: false,
+            isReady: false,
+            error: error.message
+        });
+    }
+};
+
+setTimeout(() => {
+    initializeWhatsApp();
+}, 2000);
 
 client.on('message', async (message) => {
     const from = message.from;
@@ -128,11 +239,13 @@ ${persona.extra_instructions}
     }
 });
 
-
 app.get('/api/templates', (req, res) => res.json(templates));
 
 app.post('/api/templates', (req, res) => {
     const { trigger, reply } = req.body;
+    if (!trigger || !reply) {
+        return res.status(400).json({ error: 'Trigger ve reply gereklidir' });
+    }
     templates.push({ trigger, reply });
     saveTemplates();
     res.json({ success: true });
@@ -140,12 +253,16 @@ app.post('/api/templates', (req, res) => {
 
 app.delete('/api/templates/:index', (req, res) => {
     const { index } = req.params;
+    if (index < 0 || index >= templates.length) {
+        return res.status(404).json({ error: 'Şablon bulunamadı' });
+    }
     templates.splice(index, 1);
     saveTemplates();
     res.json({ success: true });
 });
 
 app.get('/api/persona', (req, res) => res.json(persona));
+
 app.post('/api/persona', (req, res) => {
     persona = req.body;
     savePersona();
@@ -156,30 +273,194 @@ app.get('/api/status', (req, res) => {
     res.json({
         status: 'ok',
         whatsapp: client.ready ? 'connected' : 'disconnected',
-        qr: !!qrCode
+        qr: !!qrCode,
+        hasSession: fs.existsSync(SESSION_DIR),
+        state: whatsappState
+    });
+});
+
+app.get('/api/whatsapp-status', (req, res) => {
+    res.json({
+        isReady: whatsappState.isReady,
+        isAuthenticated: whatsappState.isAuthenticated,
+        hasQr: !!whatsappState.qrCode,
+        hasSession: fs.existsSync(SESSION_DIR),
+        isConnecting: whatsappState.isConnecting,
+        status: whatsappState.isReady ? 'ready' :
+            whatsappState.qrCode ? 'qr_required' :
+                whatsappState.isConnecting ? 'connecting' : 'disconnected'
     });
 });
 
 app.post('/api/request-qr', (req, res) => {
-    if (client) {
-        client.initialize();
-        res.json({ status: 'qr_requested' });
-    } else {
-        res.status(400).json({ error: 'Client not initialized' });
+    try {
+        if (client) {
+            if (fs.existsSync(SESSION_DIR)) {
+                fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+            }
+            client.initialize();
+            res.json({ status: 'qr_requested', hasSession: false });
+        } else {
+            res.status(400).json({ error: 'Client not initialized' });
+        }
+    } catch (error) {
+        console.error('QR istek hatası:', error);
+        res.status(500).json({ error: 'QR isteği başarısız' });
+    }
+});
+
+
+app.get('/api/conversations', (req, res) => {
+    try {
+        const conversations = {};
+        
+        Object.keys(messageHistory).forEach(phone => {
+            conversations[phone] = {
+                phone: phone,
+                lastMessage: messageHistory[phone][messageHistory[phone].length - 1]?.content || '',
+                lastMessageTime: new Date().toISOString(),
+                messageCount: messageHistory[phone].length,
+                history: messageHistory[phone]
+            };
+        });
+        
+        res.json(conversations);
+    } catch (error) {
+        console.error('❌ Konuşma geçmişi getirme hatası:', error);
+        res.status(500).json({ error: 'Konuşma geçmişi alınamadı' });
+    }
+});
+
+app.get('/api/conversations/:phone', (req, res) => {
+    try {
+        const { phone } = req.params;
+        const conversation = messageHistory[phone];
+        
+        if (!conversation) {
+            return res.status(404).json({ error: 'Konuşma bulunamadı' });
+        }
+        
+        res.json({
+            phone: phone,
+            history: conversation,
+            messageCount: conversation.length
+        });
+    } catch (error) {
+        console.error('❌ Konuşma detay getirme hatası:', error);
+        res.status(500).json({ error: 'Konuşma detayı alınamadı' });
+    }
+});
+
+app.delete('/api/conversations/:phone', (req, res) => {
+    try {
+        const { phone } = req.params;
+        delete messageHistory[phone];
+        res.json({ success: true });
+    } catch (error) {
+        console.error('❌ Konuşma silme hatası:', error);
+        res.status(500).json({ error: 'Konuşma silinemedi' });
+    }
+});
+
+app.delete('/api/conversations', (req, res) => {
+    try {
+        Object.keys(messageHistory).forEach(phone => {
+            delete messageHistory[phone];
+        });
+        res.json({ success: true });
+    } catch (error) {
+        console.error('❌ Tüm konuşmaları silme hatası:', error);
+        res.status(500).json({ error: 'Konuşmalar silinemedi' });
     }
 });
 
 app.post('/api/logout', async (req, res) => {
     try {
         await client.logout();
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+        if (fs.existsSync(SESSION_DIR)) {
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+        }
+        whatsappState.isReady = false;
+        whatsappState.isAuthenticated = false;
+        whatsappState.qrCode = null;
+
         res.json({ success: true });
         console.log('🚪 Oturum kapatıldı');
-        process.exit(0);
+
+        setTimeout(() => {
+            initializeWhatsApp();
+        }, 2000);
+
     } catch (err) {
         console.error('Çıkış hatası:', err);
-        res.status(500).json({ success: false });
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
-server.listen(3000, () => console.log('Server 3000 portunda çalışıyor.'));
+app.post('/api/restart', async (req, res) => {
+    try {
+        console.log('🔄 Manuel restart isteği...');
+        await client.destroy();
+        if (fs.existsSync(SESSION_DIR)) {
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+        }
+
+        whatsappState.isReady = false;
+        whatsappState.isAuthenticated = false;
+        whatsappState.qrCode = null;
+
+        setTimeout(() => {
+            initializeWhatsApp();
+        }, 1000);
+
+        res.json({ success: true, message: 'Yeniden başlatılıyor' });
+    } catch (error) {
+        console.error('Restart hatası:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+io.on('connection', (socket) => {
+    console.log('🔌 Yeni socket bağlantısı:', socket.id);
+
+    socket.emit('whatsapp_status', {
+        status: whatsappState.isReady ? 'ready' :
+            whatsappState.qrCode ? 'qr_required' :
+                whatsappState.isConnecting ? 'connecting' : 'disconnected',
+        hasSession: fs.existsSync(SESSION_DIR),
+        isReady: whatsappState.isReady
+    });
+
+    socket.on('get_status', () => {
+        socket.emit('whatsapp_status', {
+            status: whatsappState.isReady ? 'ready' :
+                whatsappState.qrCode ? 'qr_required' :
+                    whatsappState.isConnecting ? 'connecting' : 'disconnected',
+            hasSession: fs.existsSync(SESSION_DIR),
+            isReady: whatsappState.isReady
+        });
+    });
+
+    socket.on('get_qr', () => {
+        if (qrCode) {
+            socket.emit('qr', qrCode);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log('🔌 Socket bağlantısı kesildi:', socket.id);
+    });
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+});
+
+server.listen(3000, () => {
+    console.log('🚀 Server 3000 portunda çalışıyor.');
+    console.log('📱 WhatsApp session durumu:', fs.existsSync(SESSION_DIR) ? 'Mevcut' : 'Yok');
+});
